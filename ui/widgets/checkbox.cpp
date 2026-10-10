@@ -1125,8 +1125,16 @@ AccessibilityState Checkbox::accessibilityState() const {
 	return { .checkable = true, .checked = checked() };
 }
 
+QStringList Checkbox::accessibilityActionNames() {
+	return {
+		QAccessibleActionInterface::pressAction(),
+		QAccessibleActionInterface::toggleAction(),
+	};
+}
+
 void Checkbox::accessibilityDoAction(const QString &name) {
-	if (name == QAccessibleActionInterface::pressAction()) {
+	if (name == QAccessibleActionInterface::pressAction()
+		|| name == QAccessibleActionInterface::toggleAction()) {
 		if (!isDisabled()) {
 			handlePress();
 		}
