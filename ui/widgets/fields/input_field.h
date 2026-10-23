@@ -221,7 +221,8 @@ public:
 	[[nodiscard]] TextWithTags getTextWithTagsPart(
 		int start,
 		int end = -1) const;
-	[[nodiscard]] TextWithTags getTextWithAppliedMarkdown() const;
+	// Also maps an expanded-text offset past the removed Markdown markers.
+	[[nodiscard]] TextWithTags getTextWithAppliedMarkdown(int *offset = nullptr) const;
 	void insertTag(const QString &text, QString tagId = QString());
 	[[nodiscard]] bool empty() const {
 		return _lastTextWithTags.text.isEmpty();

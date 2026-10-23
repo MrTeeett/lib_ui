@@ -31,6 +31,35 @@ const auto kFormattedDateMetaTagPrefix = u"td-date-data-"_q;
 
 using namespace Ui::Text;
 
+[[nodiscard]] bool IsFencePadding(QChar ch) {
+	return ch.isSpace() || ch == QChar(0x200b) || ch == QChar(0xfeff);
+}
+
+[[nodiscard]] bool IsFenceLineBreak(QChar ch) {
+	return ch == QChar('\n') || ch == QChar('\r')
+		|| ch == QChar::LineSeparator || ch == QChar::ParagraphSeparator;
+}
+
+[[nodiscard]] bool FenceMarkerIsProtected(
+		const TextWithTags::Tags &tags,
+		int offset,
+		int length) {
+	for (const auto &tag : tags) {
+		if (tag.offset >= offset + length) {
+			break;
+		} else if (tag.offset + tag.length <= offset) {
+			continue;
+		}
+		for (const auto part : SplitTags(tag.id)) {
+			if (part == Ui::InputField::kTagCode
+				|| part.startsWith(Ui::InputField::kTagPre)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 [[nodiscard]] QString DecodeHexTagPayload(QStringView encoded) {
 	if (encoded.isEmpty() || (encoded.size() % 2)) {
 		return QString();
@@ -1365,6 +1394,89 @@ QString MarkdownPreGoodBefore() {
 
 QString MarkdownPreBadAfter() {
 	return QString::fromLatin1("`");
+}
+
+std::optional<MarkdownCodeFenceLine> ParseMarkdownCodeFenceLine(
+		QStringView line) {
+	auto from = 0;
+	while (from < line.size() && IsFencePadding(line[from])) {
+		++from;
+	}
+	auto till = from;
+	while (till < line.size() && line[till] == QChar('`')) {
+		++till;
+	}
+	if (till - from < 3) {
+		return std::nullopt;
+	}
+	auto language = line.mid(till);
+	while (!language.isEmpty() && IsFencePadding(language.front())) {
+		language = language.mid(1);
+	}
+	while (!language.isEmpty() && IsFencePadding(language.back())) {
+		language = language.left(language.size() - 1);
+	}
+	for (const auto ch : language) {
+		if (ch == QChar('`') || ch == QChar(kTagSeparator) || IsFenceLineBreak(ch)) {
+			return std::nullopt;
+		}
+	}
+	return MarkdownCodeFenceLine{
+		.offset = from,
+		.length = till - from,
+		.language = language.toString().toLower(),
+	};
+}
+
+std::vector<MarkdownCodeFence> FindMarkdownCodeFences(const TextWithTags &text) {
+	auto result = std::vector<MarkdownCodeFence>();
+	auto active = std::optional<MarkdownCodeFence>();
+	auto markerLength = 0;
+	const auto size = int(text.text.size());
+	for (auto from = 0; from < size;) {
+		auto till = from;
+		while (till < size && !IsFenceLineBreak(text.text[till])) {
+			++till;
+		}
+		auto next = till + (till < size ? 1 : 0);
+		if (till + 1 < size && text.text[till] == QChar('\r')
+			&& text.text[till + 1] == QChar('\n')) {
+			++next;
+		}
+		const auto fence = ParseMarkdownCodeFenceLine(
+			QStringView(text.text).mid(from, till - from));
+		if (fence && !FenceMarkerIsProtected(text.tags, from + fence->offset, fence->length)) {
+			if (!active) {
+				active = MarkdownCodeFence{
+					.offset = from,
+					.length = size - from,
+					.bodyOffset = next,
+					.bodyLength = size - next,
+					.language = fence->language,
+				};
+				markerLength = fence->length;
+			} else if (fence->length >= markerLength && fence->language.isEmpty()) {
+				auto bodyTill = from;
+				if (bodyTill > active->bodyOffset && IsFenceLineBreak(text.text[bodyTill - 1])) {
+					--bodyTill;
+					if (bodyTill > active->bodyOffset && text.text[bodyTill - 1] == QChar('\r')
+						&& text.text[bodyTill] == QChar('\n')) {
+						--bodyTill;
+					}
+				}
+				active->length = till - active->offset;
+				active->bodyLength = bodyTill - active->bodyOffset;
+				active->closed = true;
+				result.push_back(std::move(*active));
+				active = std::nullopt;
+			}
+		}
+		from = next;
+	}
+	if (active) {
+		result.push_back(std::move(*active));
+	}
+	return result;
 }
 
 QString MarkdownSpoilerGoodBefore() {

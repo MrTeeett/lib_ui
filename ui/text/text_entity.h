@@ -355,6 +355,26 @@ struct TextWithTags {
 
 namespace TextUtilities {
 
+struct MarkdownCodeFenceLine {
+	int offset = 0;
+	int length = 0;
+	QString language;
+};
+
+struct MarkdownCodeFence {
+	int offset = 0;
+	int length = 0;
+	int bodyOffset = 0;
+	int bodyLength = 0;
+	QString language;
+	bool closed = false;
+};
+
+[[nodiscard]] std::optional<MarkdownCodeFenceLine> ParseMarkdownCodeFenceLine(
+	QStringView line);
+[[nodiscard]] std::vector<MarkdownCodeFence> FindMarkdownCodeFences(
+	const TextWithTags &text);
+
 bool IsValidProtocol(const QString &protocol);
 bool IsValidTopDomain(const QString &domain);
 

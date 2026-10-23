@@ -570,17 +570,6 @@ void TrimFullCoverageTags(TextWithTags &parsed) {
 	return !CheckFullTextTag(textWithTags, tag).isEmpty();
 }
 
-[[nodiscard]] QString ReadPreLanguageName(
-		const QString &text,
-		int preStart,
-		int preLength) {
-	auto view = QStringView(text).mid(preStart, preLength);
-	static const auto expression = QRegularExpression(
-		"^([a-zA-Z0-9\\+\\-]+)[\\r\\n]");
-	const auto m = expression.match(view);
-	return m.hasMatch() ? m.captured(1).toLower() : QString();
-}
-
 class RangeAccumulator {
 public:
 	explicit RangeAccumulator(std::vector<InputFieldTextRange> &ranges)
@@ -882,6 +871,39 @@ public:
 			const QString &textTag) {
 		if (!_tags) {
 			return;
+		} else if (textTag.isEmpty() && adjustedTextLength == text.size()) {
+			_pendingPlainText.append(text);
+			return;
+		}
+		flushPendingPlainText();
+		feedPart(text, adjustedTextLength, textTag);
+	}
+
+	void finish() {
+		if (!_tags) {
+			return;
+		}
+		flushPendingPlainText();
+		finishTags();
+		if (_currentTag < _tags->size()) {
+			_tags->resize(_currentTag);
+		}
+	}
+
+private:
+	void flushPendingPlainText() {
+		if (_pendingPlainText.isEmpty()) {
+			return;
+		}
+		const auto text = base::take(_pendingPlainText);
+		feedPart(text, text.size(), QString());
+	}
+	void feedPart(
+			const QString &text,
+			int adjustedTextLength,
+			const QString &textTag) {
+		if (!_tags) {
+			return;
 		}
 		const auto guard = gsl::finally([&] {
 			_currentInternalLength += text.size();
@@ -938,17 +960,6 @@ public:
 		}
 	}
 
-	void finish() {
-		if (!_tags) {
-			return;
-		}
-		finishTags();
-		if (_currentTag < _tags->size()) {
-			_tags->resize(_currentTag);
-		}
-	}
-
-private:
 	void finishTag(int index, int offsetFromAccumulated, bool closed) {
 		Expects(_tags != nullptr);
 		Expects(index >= 0 && index < _tags->size());
@@ -1065,6 +1076,7 @@ private:
 	const std::vector<TagStartExpression> &_expressions;
 	const std::map<QString, int> &_tagIndices;
 	std::vector<TagSearchItem> _items;
+	QString _pendingPlainText;
 
 	int _currentTag = 0;
 	int _currentFreeTag = 0;
@@ -4155,113 +4167,124 @@ TextWithTags InputField::getTextWithTagsPart(int start, int end) const {
 	return result;
 }
 
-TextWithTags InputField::getTextWithAppliedMarkdown() const {
-	if (!_markdownEnabledState.typedTagsEnabled()
-		|| _lastMarkdownTags.empty()) {
+TextWithTags InputField::getTextWithAppliedMarkdown(int *offset) const {
+	if (!_markdownEnabledState.typedTagsEnabled()) {
 		return getTextWithTags();
 	}
+	struct Tag {
+		int offset = 0;
+		int length = 0;
+		int bodyOffset = 0;
+		int bodyLength = 0;
+		QString id;
+		bool fenced = false;
+	};
+	const auto fences = TextUtilities::FindMarkdownCodeFences(_lastTextWithTags);
+	auto tags = std::vector<Tag>();
+	for (const auto &tag : _lastMarkdownTags) {
+		if (!tag.closed || tag.tag == kTagPre) {
+			continue;
+		}
+		const auto till = tag.adjustedStart + tag.adjustedLength;
+		if (ranges::any_of(fences, [&](const auto &fence) {
+			return tag.adjustedStart < fence.offset + fence.length
+				&& till > fence.offset;
+		})) {
+			continue;
+		}
+		const auto edge = int(tag.tag.size());
+		tags.push_back({ tag.adjustedStart, tag.adjustedLength,
+			tag.adjustedStart + edge, tag.adjustedLength - 2 * edge, tag.tag });
+	}
+	for (const auto &fence : fences) {
+		if (!fence.closed || fence.bodyLength <= 0) {
+			continue;
+		}
+		const auto body = base::StringViewMid(
+			_lastTextWithTags.text,
+			fence.bodyOffset,
+			fence.bodyLength);
+		if (!body.contains(QChar::ObjectReplacementCharacter)) {
+			tags.push_back({
+				.offset = fence.offset,
+				.length = fence.length,
+				.bodyOffset = fence.bodyOffset,
+				.bodyLength = fence.bodyLength,
+				.id = kTagPre + fence.language,
+				.fenced = true,
+			});
+		}
+	}
+	if (tags.empty()) {
+		return getTextWithTags();
+	}
+	ranges::sort(tags, ranges::less(), &Tag::offset);
 	const auto &originalText = _lastTextWithTags.text;
 	const auto &originalTags = _lastTextWithTags.tags;
-
-	// Ignore tags that partially intersect some http-links.
-	// This will allow sending http://test.com/__test__/test correctly.
-	const auto links = TextUtilities::ParseEntities(
-		originalText,
-		0).entities;
-
+	const auto originalOffset = offset ? *offset : 0;
+	const auto links = TextUtilities::ParseEntities(originalText, 0).entities;
 	auto result = TextWithTags();
 	result.text.reserve(originalText.size());
-	result.tags.reserve(originalTags.size() + _lastMarkdownTags.size());
-	auto removed = 0;
+	result.tags.reserve(originalTags.size() + tags.size());
 	auto originalTag = originalTags.begin();
-	const auto originalTagsEnd = originalTags.end();
-	const auto addOriginalTagsUpTill = [&](int offset) {
-		while (originalTag != originalTagsEnd
-			&& originalTag->offset + originalTag->length <= offset) {
-			result.tags.push_back(*originalTag++);
-			result.tags.back().offset -= removed;
+	const auto appendOriginal = [&](int from, int till) {
+		if (from == till) {
+			return;
+		}
+		const auto offset = int(result.text.size());
+		result.text.append(base::StringViewMid(originalText, from, till - from));
+		while (originalTag != originalTags.end()
+			&& originalTag->offset + originalTag->length <= from) {
+			++originalTag;
+		}
+		while (originalTag != originalTags.end() && originalTag->offset < till) {
+			const auto start = std::max(from, originalTag->offset);
+			const auto end = std::min(till, originalTag->offset + originalTag->length);
+			result.tags.push_back({ offset + start - from, end - start, originalTag->id });
+			if (originalTag->offset + originalTag->length > till) {
+				break;
+			}
+			++originalTag;
 		}
 	};
 	auto from = 0;
-	const auto addOriginalTextUpTill = [&](int offset) {
-		if (offset > from) {
-			result.text.append(base::StringViewMid(originalText, from, offset - from));
-		}
-	};
 	auto link = links.begin();
-	const auto linksEnd = links.end();
-	for (const auto &tag : _lastMarkdownTags) {
-		const auto tagLength = int(tag.tag.size());
-		if (!tag.closed || tag.adjustedStart < from) {
+	for (const auto &tag : tags) {
+		if (tag.offset < from || tag.bodyLength <= 0) {
 			continue;
 		}
-		auto entityLength = tag.adjustedLength - 2 * tagLength;
-		if (entityLength <= 0) {
-			continue;
-		}
-		addOriginalTagsUpTill(tag.adjustedStart);
-		const auto tagAdjustedEnd = tag.adjustedStart + tag.adjustedLength;
-		if (originalTag != originalTagsEnd
-			&& originalTag->offset < tagAdjustedEnd) {
-			continue;
-		}
-		while (link != linksEnd
-			&& link->offset() + link->length() <= tag.adjustedStart) {
-			++link;
-		}
-		if (link != linksEnd
-			&& link->offset() < tagAdjustedEnd
-			&& (link->offset() + link->length() > tagAdjustedEnd
-				|| link->offset() < tag.adjustedStart)) {
-			continue;
-		}
-		addOriginalTextUpTill(tag.adjustedStart);
-
-		auto tagId = tag.tag;
-		auto entityStart = tag.adjustedStart + tagLength;
-		if (tagId == kTagPre) {
-			// Remove redundant newlines for pre.
-			// If ``` is on a separate line add only one newline.
-			const auto languageName = ReadPreLanguageName(
-				originalText,
-				entityStart,
-				entityLength);
-			if (!languageName.isEmpty()) {
-				// ```language-name{\n}code
-				entityStart += languageName.size() + 1;
-				entityLength -= languageName.size() + 1;
-				tagId += languageName;
-			} else if (IsNewline(originalText[entityStart])
-				&& (result.text.isEmpty()
-					|| IsNewline(result.text[result.text.size() - 1]))) {
-				++entityStart;
-				--entityLength;
+		const auto till = tag.offset + tag.length;
+		if (!tag.fenced) {
+			const auto intersecting = ranges::upper_bound(
+				originalTags,
+				tag.offset,
+				ranges::less(),
+				[](const auto &value) { return value.offset + value.length; });
+			if (intersecting != originalTags.end() && intersecting->offset < till) {
+				continue;
 			}
-			const auto entityEnd = entityStart + entityLength;
-			if (IsNewline(originalText[entityEnd - 1])
-				&& (originalText.size() <= entityEnd + tagLength
-					|| IsNewline(originalText[entityEnd + tagLength]))) {
-				--entityLength;
+			while (link != links.end() && link->offset() + link->length() <= tag.offset) {
+				++link;
+			}
+			// Ignore tags that partially intersect some http-links.
+			// This will allow sending http://test.com/__test__/test correctly.
+			if (link != links.end() && link->offset() < till
+				&& (link->offset() < tag.offset || link->offset() + link->length() > till)) {
+				continue;
 			}
 		}
-
-		if (entityLength > 0) {
-			// Add tag text and entity.
-			result.tags.push_back(TextWithTags::Tag{
-				int(result.text.size()),
-				entityLength,
-				tagId });
-			result.text.append(base::StringViewMid(
-				originalText,
-				entityStart,
-				entityLength));
+		appendOriginal(from, tag.offset);
+		if (offset && originalOffset >= till) {
+			*offset -= tag.length - tag.bodyLength;
+		} else if (offset && originalOffset >= tag.offset) {
+			*offset = int(result.text.size())
+				+ std::clamp(originalOffset - tag.bodyOffset, 0, tag.bodyLength);
 		}
-
-		from = tag.adjustedStart + tag.adjustedLength;
-		removed += (tag.adjustedLength - entityLength);
+		result.tags.push_back({ int(result.text.size()), tag.bodyLength, tag.id });
+		result.text.append(base::StringViewMid(originalText, tag.bodyOffset, tag.bodyLength));
+		from = till;
 	}
-	addOriginalTagsUpTill(originalText.size());
-	addOriginalTextUpTill(originalText.size());
+	appendOriginal(from, originalText.size());
 	return result;
 }
 
@@ -4899,7 +4922,16 @@ bool InputField::processMarkdownReplaces(const QString &appended) {
 		return false;
 	}
 	const auto position = textCursor().position();
+	const auto fences = _markdownEnabledState.typedTagsEnabled()
+		? TextUtilities::FindMarkdownCodeFences(_lastTextWithTags)
+		: std::vector<TextUtilities::MarkdownCodeFence>();
 	for (const auto &tag : _lastMarkdownTags) {
+		if (ranges::any_of(fences, [&](const auto &fence) {
+			return tag.adjustedStart < fence.offset + fence.length
+				&& tag.adjustedStart + tag.adjustedLength > fence.offset;
+		})) {
+			continue;
+		}
 		if (!tag.closed
 			|| (tag.internalStart + tag.internalLength != position)
 			|| (tag.internalLength <= 2 * int(tag.tag.size()))
