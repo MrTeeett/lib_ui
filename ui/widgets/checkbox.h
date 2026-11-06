@@ -212,6 +212,7 @@ public:
 		return _text.toString();
 	}
 	AccessibilityState accessibilityState() const override;
+	QStringList accessibilityActionNames() override;
 	void accessibilityDoAction(const QString &name) override;
 
 	void setText(const QString &text);
